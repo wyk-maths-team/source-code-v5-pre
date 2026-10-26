@@ -1,6 +1,6 @@
 import pg from 'pg';
 const {Pool}=pg;
-let _pool=null;
+let _pool=null; 
 export function getPgPool(){
   if(_pool)return _pool;
   const connectionString=process.env.DATABASE_URL;
