@@ -120,7 +120,7 @@ async function handler(req, res) {
       const me = await meRes.json();
       const email = me.mail || me.userPrincipalName;
       const msDisplayName = (me.displayName || '').trim();
-      // ⭐ 從微軟的 displayName 抽出真名（如 'Li Ching Shun'）
+      // ⭐ 從微軟的 displayName 抽出真名（如 ''）
       const realName = extractRealName(msDisplayName);
 
       if (!email || !email.endsWith('@' + allowedDomain)) {

@@ -525,25 +525,16 @@ const isPeriodMode = VALID_PERIODS.has(period);
 // ─────────── 周期榜分支 ───────────
 if (isPeriodMode) {
   const nowMs = Date.now();
-  const windowMs = period === 'daily'   ? 24 * 3600_000
-                 : period === 'weekly'  ? 7 * 24 * 3600_000
-                 :                        30 * 24 * 3600_000;
-  const since = new Date(nowMs - windowMs);
+  const days = period === 'daily' ? 1 : period === 'weekly' ? 7 : 30;
 
-  // 1) 聚合：窗口内每个用户 AC 的不同题目
-  const AC_FILTER = {
-    $or: [
-      { type: 'image', marked: true, score: 100 },
-      { type: { $ne: 'image' }, correct: true, systemError: { $ne: true } },
-    ],
-  };
+  const HEARTBEAT_MS = Number(process.env.ONLINE_HEARTBEAT_MS) || 5 * 60 * 1000;
+  const TIMEOUT_MS   = Number(process.env.ONLINE_TIMEOUT_MS)   || HEARTBEAT_MS * 2;
+  const serverNow    = Date.now();
 
-  const rows = await db.collection('submissions').aggregate([
-    { $match: { timestamp: { $gte: since }, ...AC_FILTER } },
-    { $group: { _id: { u: '$username', p: '$problemId' } } },
-    { $group: { _id: '$_id.u', solves: { $sum: 1 } } },
-    { $sort: { solves: -1, _id: 1 } },
-  ]).toArray();
+  // ⭐ 改成 PostgreSQL：一条 SQL 就拿到「窗口内 AC 的不同题目数 + 用户资料 + 在线状态」。
+  //    原来要三步：聚合 submissions → 拉 users → 在 JS 里过滤 banned/team。
+  const P = await import('../lib/pgStore.js');
+  const rows = await P.getLeaderboardPeriod(days, 200, 0);
 
   if (rows.length === 0) {
     const empty = {
@@ -551,53 +542,28 @@ if (isPeriodMode) {
       leaderboard: [],
       period,
       serverNow: nowMs,
-      heartbeatMs: Number(process.env.ONLINE_HEARTBEAT_MS) || 5 * 60 * 1000,
-      timeoutMs: (Number(process.env.ONLINE_HEARTBEAT_MS) || 5 * 60 * 1000) * 2,
+      heartbeatMs: HEARTBEAT_MS,
+      timeoutMs: TIMEOUT_MS,
     };
     return res.status(200).json(empty);
   }
 
-  const usernames = rows.map(r => r._id);
-
-  // 2) 拉用户资料（保持和 overall 同样的字段）
-  const users = await db.collection('users')
-    .find(
-      { username: { $in: usernames } },
-      { projection: { username: 1, pfp: 1, displayName: 1, realName: 1,
-                      banned: 1, role: 1, lastSeenAt: 1, explicitlyOffline: 1 } }
-    )
-    .toArray();
-  const userMap = Object.fromEntries(users.map(u => [u.username, u]));
-
-  const HEARTBEAT_MS = Number(process.env.ONLINE_HEARTBEAT_MS) || 5 * 60 * 1000;
-  const TIMEOUT_MS   = Number(process.env.ONLINE_TIMEOUT_MS)   || HEARTBEAT_MS * 2;
-  const serverNow    = Date.now();
-
-  const leaderboard = rows
-    .filter(r => {
-      const u = userMap[r._id];
-      if (u && u.banned === true) return false;
-      if (u && u.role === 'team')  return false;
-      return true;
-    })
-    .map((r, idx) => {
-      const u = userMap[r._id] || {};
-      const lastSeenMs = u.lastSeenAt ? new Date(u.lastSeenAt).getTime() : 0;
-      const online = !u.explicitlyOffline && lastSeenMs > 0 &&
-                     (serverNow - lastSeenMs) < TIMEOUT_MS;
-      return {
-        rank: idx + 1,
-        username: r._id,
-        displayName: u.displayName || r._id,
-        solves: r.solves,
-        pfp: u.pfp || '',
-        realName: u.realName || '',
-        online,
-        lastSeenAt: u.lastSeenAt || null,
-        explicitlyOffline: !!u.explicitlyOffline,
-        // 周期榜不带 rating 字段（前端会跳过 ratingBadge）
-      };
-    });
+  const leaderboard = rows.map((r, idx) => {
+    const lastSeenMs = r.lastSeenAt ? new Date(r.lastSeenAt).getTime() : 0;
+    const online = lastSeenMs > 0 && (serverNow - lastSeenMs) < TIMEOUT_MS;
+    return {
+      rank: idx + 1,
+      username: r.username,
+      displayName: r.displayName || r.username,
+      solves: r.solves,
+      pfp: r.pfp || '',
+      realName: r.realName || '',
+      online,
+      lastSeenAt: r.lastSeenAt || null,
+      explicitlyOffline: false,
+      // 周期榜不带 rating 字段（前端会跳过 ratingBadge）
+    };
+  });
 
   return res.status(200).json({
     success: true,
@@ -612,56 +578,25 @@ if (isPeriodMode) {
       if (_leaderboardCache.data && _leaderboardCache.expireAt > now) {
         return res.status(200).json(_leaderboardCache.data);
       }
-      // ─────────── 判定期望周期 ───────────
 
+      // ⭐ 总榜改成直接从 PostgreSQL 聚合（原来是读 Mongo 的 leaderboardView 物化视图）。
+      //    user_problem_status 的 status='passed' 就是权威的 AC 记录，
+      //    不需要再维护一份物化视图。
+      const P = await import('../lib/pgStore.js');
+      const rows = await P.getLeaderboardOverall(500, 0);
 
-// ─────────── 以下保持原本 overall 逻辑不变 ───────────
-// （原代码里 "const leaderboardData = await db.collection('leaderboardView')..."）
-      const leaderboardData = await db.collection('leaderboardView').find({}).toArray();
-      const usernames = leaderboardData.map(e => e.username);
-
-      // ⭐ 多取 lastSeenAt
-      const users = await db.collection('users')
-        .find(
-          { username: { $in: usernames } },
-          { projection: { username: 1, pfp: 1, displayName: 1, realName: 1, banned: 1, role: 1, lastSeenAt: 1, explicitlyOffline: 1 } }
-        )
-        .toArray();
-
-      const userMap = Object.fromEntries(users.map(u => [u.username, u]));
-
-      // ⭐ 在线判定阈值
       const HEARTBEAT_MS = Number(process.env.ONLINE_HEARTBEAT_MS) || 5 * 60 * 1000;
       const TIMEOUT_MS   = Number(process.env.ONLINE_TIMEOUT_MS)   || HEARTBEAT_MS * 2;
       const serverNow    = Date.now();
 
-      const leaderboard = leaderboardData
-        .filter(entry => {
-          const u = userMap[entry.username];
-          if (u && u.banned === true) return false;
-          if (u && u.role === 'team') return false;
-          return true;
-        })
-        .map((entry, idx) => {
-          const u = userMap[entry.username] || {};
-          const lastSeenMs = u.lastSeenAt ? new Date(u.lastSeenAt).getTime() : 0;
-          const online = !u.explicitlyOffline && lastSeenMs > 0 && (serverNow - lastSeenMs) < TIMEOUT_MS;
-          return {
-            rank: idx + 1,
-            username: entry.username,
-            displayName: entry.displayName || u.displayName || entry.username,
-            solves: entry.solves,
-            pfp: u.pfp || '',
-            realName: u.realName || '',
-            online,
-            lastSeenAt: u.lastSeenAt || null,
-            explicitlyOffline: !!u.explicitlyOffline,   // ⭐ 新增
-          };
-        });
-              // ⭐ 計算 Rating（三步算法 + σ 調節）
-      const statsDocs = await db.collection('userstats')
-        .find({ username: { $in: leaderboard.map(u => u.username) } })
-        .toArray();
+      // ⭐ Rating 仍走 Mongo 的物化缓存（userstats.rating / ratingSolvedCount）。
+      //    那份缓存还没迁到 PG，所以这里保留 Mongo 读取；
+      //    榜单本身已经来自 PG，两边的 solvedCount 由同一套 states 派生，不会不一致。
+      const usernames = rows.map(r => r.username);
+
+      const statsDocs = usernames.length
+        ? await db.collection('userstats').find({ username: { $in: usernames } }).toArray()
+        : [];
 
       const allPids = new Set();
       statsDocs.forEach(s => Object.keys(s.states || {}).forEach(pid => allPids.add(pid)));
@@ -672,15 +607,14 @@ if (isPeriodMode) {
             .toArray()
         : [];
       const diffMap = Object.fromEntries(problemDocs.map(p => [String(p.id), Number(p.difficulty) || 0]));
-
       const statsMap = Object.fromEntries(statsDocs.map(s => [s.username, s]));
 
-      // ⭐ Rating：优先用 userstats 上的物化值。
-      //    以前是 U 个用户各跑一遍 sort + 加权（O(U·n log n)）；
-      //    现在 solvedCount 没变就直接读缓存，只有真正变化的少数用户才重算。
       const RATING_MAX_AGE_MS = 7 * 24 * 3600_000;
 
-      for (const u of leaderboard) {
+      const leaderboard = rows.map(u => {
+        const lastSeenMs = u.lastSeenAt ? new Date(u.lastSeenAt).getTime() : 0;
+        const online = lastSeenMs > 0 && (serverNow - lastSeenMs) < TIMEOUT_MS;
+
         const doc = statsMap[u.username];
         const states = doc?.states || {};
 
@@ -698,21 +632,35 @@ if (isPeriodMode) {
         const updatedAt = doc?.ratingUpdatedAt ? new Date(doc.ratingUpdatedAt).getTime() : 0;
         const cacheFresh = updatedAt > 0 && (Date.now() - updatedAt) < RATING_MAX_AGE_MS;
 
+        let rating, tier, effectiveMax;
         if (cached != null && cachedCount === solvedCount && cacheFresh && doc?.ratingMeta) {
-          const tier = getTier(cached);
-          u.rating = cached;
-          u.tierColor = tier.color;
-          u.tierGlow = tier.glow;
-          u.maxDifficulty = doc.ratingMeta.effectiveMax;
-          continue;
+          rating = cached;
+          tier = getTier(cached);
+          effectiveMax = doc.ratingMeta.effectiveMax;
+        } else {
+          const r = calculateUserRating({ solvedDifficulties: solvedDiffs });
+          rating = r.rating;
+          tier = r.tier;
+          effectiveMax = r.effectiveMax;
         }
 
-        const r = calculateUserRating({ solvedDifficulties: solvedDiffs });
-        u.rating = r.rating;
-        u.tierColor = r.tier.color;
-        u.tierGlow = r.tier.glow;
-        u.maxDifficulty = r.effectiveMax;   // ← 原来是 r.maxPR，字段名不存在，永远是 undefined
-      }
+        return {
+          rank: u.rank,
+          username: u.username,
+          displayName: u.displayName,
+          solves: u.solves,
+          pfp: u.pfp,
+          realName: u.realName,
+          online,
+          lastSeenAt: u.lastSeenAt || null,
+          explicitlyOffline: false,
+          rating,
+          tierColor: tier.color,
+          tierGlow: tier.glow,
+          maxDifficulty: effectiveMax,
+        };
+      });
+
       const payload = { success: true, leaderboard, serverNow, heartbeatMs: HEARTBEAT_MS, timeoutMs: TIMEOUT_MS };
       _leaderboardCache = { data: payload, expireAt: Date.now() + LEADERBOARD_TTL };
       return res.status(200).json(payload);
@@ -724,60 +672,51 @@ if (isPeriodMode) {
 
       const isAdminUser = decoded.role === 'admin' || decoded.role === 'root';
 
-      // 题库元数据走 60s 缓存（lib/problemCache.js），不再每个请求拉 2400 行。
-      // 同时把「遍历全部题目」改成「遍历用户做过的题目」，两者都省一个数量级。
-      const { getPublicProblems, getAllProblems } = await import('../lib/problemCache.js');
-      const problemData = isAdminUser ? await getAllProblems(db) : await getPublicProblems(db);
+      // ⭐ 核心三表已迁移到 PostgreSQL，统一走 lib/pgStore.js。
+      //    只有 userdata（主题设置）还在 MongoDB —— 那张表本轮没迁。
+      const P = await import('../lib/pgStore.js');
 
-      const [userStats, user, userdata] = await Promise.all([
-        db.collection('userstats').findOne({ username }, { projection: { states: 1, _id: 0 } }),
-        db.collection('users').findOne(
-          { username },
-          { projection: { pfp: 1, displayName: 1, realName: 1, heartbeatCount: 1, lastSeenAt: 1, _id: 0 } }
-        ),
-        db.collection('userdata').findOne({ username }, { projection: { theme: 1, _id: 0 } }) // ⭐ 新增
+      const [user, statusList, statsCache, allIds, userdata] = await Promise.all([
+        P.getUser(username),
+        // 只返回该用户做过的题；publicOnly 让非管理员看不到隐藏题
+        P.getUserProblemStatus(username, { publicOnly: !isAdminUser }),
+        P.getUserStatsCache(username),
+        isAdminUser ? P.getAllProblemIds() : P.getPublicProblemIds(),
+        db.collection('userdata').findOne({ username }, { projection: { theme: 1, _id: 0 } }),
       ]);
 
-      const states = userStats?.states || {};
-      const attempted = [];
-      let totalPassed = 0;
-
-      // 只遍历用户做过的题，不再扫全库
-      for (const pid of Object.keys(states)) {
-        if (!problemData.idSet.has(pid)) continue;           // 非 public 的题不计入（非管理员视角）
-        const state = states[pid];
-        if (state === 'passed') {
-          totalPassed++;
-          attempted.push({ id: pid, state: 'passed' });
-        } else if (state === 'failed') {
-          attempted.push({ id: pid, state: 'failed' });
-        }
+      if (!user) {
+        return res.status(404).json({ success: false, message: 'User not found' });
       }
 
-      // ⭐ Rating 走物化缓存，不再这里重算 O(n log n)
+      const attempted = statusList.map(s => ({ id: s.id, state: s.state }));
+      const totalPassed = statusList.filter(s => s.state === 'passed').length;
+
+      // ⭐ Rating 仍走原实现（lib/userRating.js 读的是 Mongo 的物化缓存）。
+      //    等那份缓存也迁过来再换掉。
       const { getUserRating } = await import('../lib/userRating.js');
       const ratingResult = await getUserRating(db, username);
 
       const HEARTBEAT_MS = Number(process.env.ONLINE_HEARTBEAT_MS) || 5 * 60 * 1000;
       const TIMEOUT_MS   = Number(process.env.ONLINE_TIMEOUT_MS)   || HEARTBEAT_MS + 2 * 60 * 1000;
-      const heartbeats   = Number(user?.heartbeatCount) || 0;
+      const heartbeats   = statsCache?.heartbeatCount || 0;
       const totalOnlineMs = heartbeats * HEARTBEAT_MS;
-      const lastSeenMs   = user?.lastSeenAt ? new Date(user.lastSeenAt).getTime() : 0;
+      const lastSeenMs   = statsCache?.lastSeenAt ? new Date(statsCache.lastSeenAt).getTime() : 0;
       const online       = lastSeenMs > 0 && (Date.now() - lastSeenMs) < TIMEOUT_MS;
 
       return res.status(200).json({
         success: true,
         username,
-        displayName: user?.displayName || username,
-        realName: user?.realName || '',
-        pfp: user?.pfp || '',
+        displayName: user.displayName || username,
+        realName: user.realName || '',
+        pfp: user.pfp || '',
         totalPassed,
-        totalProblems: problemData.list.length,
+        totalProblems: allIds.length,
         attempted,
-        allProblemIds: problemData.ids,
+        allProblemIds: allIds,
         online,
         totalOnlineMs,
-        lastSeenAt: user?.lastSeenAt || null,
+        lastSeenAt: statsCache?.lastSeenAt || null,
         // ⭐ Rating
         rating: ratingResult.rating,
         tierColor: ratingResult.tier.color,

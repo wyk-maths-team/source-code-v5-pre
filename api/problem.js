@@ -1,4 +1,4 @@
-﻿// api/problem.js
+// api/problem.js
 import { connectToDatabase } from './_db.js';
 import { auditLog } from '../lib/audit.js';
 import { verifyToken } from '../lib/auth.js';
@@ -558,56 +558,31 @@ async function handler(req, res) {
 
     const adminUser = isAdminUser(req.user);
 
-    const currentFilter = adminUser ? { id: pid } : { id: pid, public: true };
-    const current = await db.collection('problems').findOne(
-      currentFilter,
-      { projection: { id: 1, tags: 1, difficulty: 1, name: 1 } }
-    );
+    // ⭐ 相似题目改成 PostgreSQL：
+    //    原来是一条 MongoDB 聚合（$setIntersection 算共同标签数）。
+    //    PG 里用 problem_tags 自连接 GROUP BY 得到同一结果，而且能走索引。
+    const P = await import('../lib/pgStore.js');
+
+    const [current, curTags] = await Promise.all([
+      P.getProblem(pid),
+      P.getProblemTags(pid),
+    ]);
+
     if (!current) return res.status(404).json({ success: false, message: 'Problem not found' });
-
-    const curTags = Array.isArray(current.tags) ? current.tags.filter(Boolean) : [];
-    const curDiff = Number(current.difficulty) || 0;
-
-    const baseFilter = adminUser ? {} : { public: true };
-    const excludeSelf = { ...baseFilter, id: { $ne: current.id } };
-
-    const pipeline = [
-      { $match: excludeSelf },
-      {
-        $addFields: {
-          commonTags: {
-            $size: { $setIntersection: [{ $ifNull: ['$tags', []] }, curTags] }
-          },
-          diffDelta: {
-            $abs: { $subtract: [{ $ifNull: ['$difficulty', 0] }, curDiff] }
-          }
-        }
-      }
-    ];
-
-    if (curTags.length > 0) {
-      pipeline.push({ $match: { commonTags: { $gt: 0 } } });
-      pipeline.push({
-        $addFields: { score: { $subtract: [{ $multiply: ['$commonTags', 10] }, '$diffDelta'] } }
-      });
-      pipeline.push({ $sort: { score: -1, id: 1 } });
-    } else {
-      pipeline.push({ $sort: { diffDelta: 1, id: 1 } });
+    if (!adminUser && !current.public) {
+      return res.status(404).json({ success: false, message: 'Problem not found' });
     }
 
-    pipeline.push({ $limit: 15 });
-    pipeline.push({
-      $project: {
-        id: 1, name: 1, tags: 1, difficulty: 1,
-        commonTags: 1, diffDelta: 1, _id: 0
-      }
-    });
+    const curDiff = Number(current.difficulty) || 0;
 
-    const similar = await db.collection('problems').aggregate(pipeline).toArray();
+    // 没有标签时退化到「难度最接近」，对应原来的 diffDelta 排序
+    const similar = curTags.length > 0
+      ? await P.similarProblems(pid, curDiff, 15)
+      : await P.nearestByDifficulty(pid, curDiff, 15);
 
     return res.status(200).json({
       success: true,
-      current: { id: current.id, tags: curTags, difficulty: curDiff },
+      current: { id: pid, tags: curTags, difficulty: curDiff },
       similar
     });
   }
@@ -753,13 +728,14 @@ async function handler(req, res) {
     try {
       const adminUser = isAdminUser(req.user);
 
-      // 三件事並行拉；userstats 只投影當前題的 state（states.<id>）
-      const [problem, statsDoc, userdataDoc] = await Promise.all([
-        db.collection('problems').findOne({ id }),
-        db.collection('userstats').findOne(
-          { username: req.user.username },
-          { projection: { [`states.${id}`]: 1, _id: 0 } }
-        ),
+      // ⭐ problems 和 userstats 已迁到 PostgreSQL，走 lib/pgStore.js。
+      //    getProblem 默认不取 answer/logic（判题才需要），所以不用再手动剥离。
+      //    userdata（收藏）还没迁，继续读 Mongo。
+      const P = await import('../lib/pgStore.js');
+
+      const [problem, state, userdataDoc] = await Promise.all([
+        P.getProblem(id),
+        P.getProblemState(req.user.username, id),
         db.collection('userdata').findOne(
           { username: req.user.username },
           { projection: { favorites: 1, _id: 0 } }
@@ -770,16 +746,16 @@ async function handler(req, res) {
         return res.status(404).json({ success: false, message: 'Problem not found' });
       }
 
-            if (!adminUser) {
+      if (!adminUser) {
         let canView = problem.public;
         if (!canView) {
           const now = new Date();
-          // ⭐ 检查是否属于某个进行中的 special contest 的队伍
+          // ⭐ teams / contests 还没迁到 PG，继续走 Mongo
           const team = await db.collection('teams').findOne({
             members: req.user.username,
             startTime: { $lte: now }   // 用 contests 的关联条件
           });
-          
+
           // 常规检查
           const contest = await db.collection('contests').findOne({
             participants: req.user.username,
@@ -793,7 +769,7 @@ async function handler(req, res) {
             'problems.problemId': id
           });
           if (contest) canView = true;
-          
+
           // ⭐ Team 检查
           if (!canView) {
             const activeSpecials = await db.collection('contests').find({
@@ -806,14 +782,14 @@ async function handler(req, res) {
                 ]
               }
             }, { projection: { id: 1, problems: 1 } }).toArray();
-            
+
             for (const c of activeSpecials) {
               const hasProblem = (c.problems || []).some(p => {
                 const pid = (typeof p === 'object' && p.problemId) ? String(p.problemId) : String(p);
                 return pid === id;
               });
               if (!hasProblem) continue;
-              
+
               const t = await db.collection('teams').findOne({
                 contestId: c.id,
                 members: req.user.username
@@ -827,11 +803,9 @@ async function handler(req, res) {
         }
       }
 
-      // 剝離 ans + logic
-      const { ans, logic, _id, ...safeProblem } = problem;
+      // 双保险：即使 getProblem 以后改成带 answer，这里也不外泄
+      const { ans, logic, ...safeProblem } = problem;
 
-      // 只回傳當前題的狀態與收藏狀態
-      const state = statsDoc?.states?.[id] || 'not_started';
       const favorited = Array.isArray(userdataDoc?.favorites) && userdataDoc.favorites.includes(id);
 
       return res.status(200).json({
